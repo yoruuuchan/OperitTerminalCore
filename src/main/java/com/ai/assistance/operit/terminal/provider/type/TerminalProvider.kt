@@ -46,6 +46,8 @@ interface TerminalProvider {
     
     /**
      * 断开连接
+     *
+     * 返回时隐藏执行器的进程已经终止：调用方可以在返回后直接回收环境资源。
      */
     suspend fun disconnect()
     

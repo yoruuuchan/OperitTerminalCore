@@ -284,6 +284,35 @@ class LocalTerminalProviderTest {
         }
     }
 
+    @Test(timeout = 15_000)
+    fun disconnectRetiresActiveExecutorsBeforeItReturns() {
+        val process = FakeProcess(blockOnClose = true)
+        withProvider(process) {
+            val call = command()
+            process.awaitCommand()
+            val disconnect = submit { provider.disconnect() }
+            try {
+                process.closeEntered.awaitBounded("hidden exec writer close")
+                disconnect.assertPending("disconnect must wait for the teardown it started")
+                assertEquals(
+                    "the shell process must be destroyed before its writer is closed",
+                    0L,
+                    process.destroyed.count
+                )
+            } finally {
+                process.closeReleased.countDown()
+            }
+            disconnect.await()
+            assertRetired(process)
+            try {
+                call.await()
+            } catch (_: CancellationException) {
+                // A call whose executor was retired mid-flight settles as cancellation, not a hang.
+            }
+            assertEquals(1, starts.get())
+        }
+    }
+
     private fun withProvider(
         vararg processes: FakeProcess,
         start: (Int) -> Process = { processes[it] },
@@ -350,6 +379,7 @@ class LocalTerminalProviderTest {
     private class FakeProcess(
         ready: Boolean = true,
         private val stallWrites: Boolean = false,
+        private val blockOnClose: Boolean = false,
         private val respond: (FakeProcess, String) -> Unit = { process, token ->
             process.complete(token, "ok")
         }
@@ -358,6 +388,8 @@ class LocalTerminalProviderTest {
         val destroyed = CountDownLatch(1)
         val writeEntered = CountDownLatch(1)
         val writeReleased = CountDownLatch(1)
+        val closeEntered = CountDownLatch(1)
+        val closeReleased = CountDownLatch(1)
         val commandCount = AtomicInteger()
         private val terminated = CountDownLatch(1)
         private val releaseWrite = CountDownLatch(1)
@@ -404,6 +436,20 @@ class LocalTerminalProviderTest {
                 stdout.emit("__OPERIT_HIDDEN_BEGIN__:$token\n__OPERIT_HIDDEN_PID__:$token:not-a-pid\n")
                 commands.add(token)
                 respond(this@FakeProcess, token)
+            }
+
+            override fun close() {
+                if (blockOnClose) {
+                    closeEntered.countDown()
+                    // Model a writer whose close only unblocks once teardown has released it.
+                    while (closeReleased.count != 0L) {
+                        try {
+                            closeReleased.await()
+                        } catch (_: InterruptedException) {
+                            // Keep modelling a blocked close until the test releases it.
+                        }
+                    }
+                }
             }
         }
 

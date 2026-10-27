@@ -82,6 +82,14 @@ class LocalTerminalProvider private constructor(
     private val hiddenExecShellMutex = Mutex()
     private val hiddenExecScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
+    /**
+     * Teardown outlives [hiddenExecScope]: [disconnect] retires executors while it shuts the exec
+     * scope down, and a process whose creation raced with cancellation still has to be destroyed
+     * afterwards. Shell teardown runs in the caller's scope (as a [NonCancellable] block); only
+     * work that cannot suspend uses this scope.
+     */
+    private val hiddenExecCleanupScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
     companion object {
         private const val TAG = "LocalTerminalProvider"
         private const val READY_MARKER = "TERMINAL_READY"
@@ -99,10 +107,12 @@ class LocalTerminalProvider private constructor(
     }
 
     override suspend fun disconnect() {
-        hiddenExecScope.cancel()
+        // Retire executors before cancelling the exec scope: disconnect() must return with their
+        // processes already gone, and teardown must not depend on a scope that is being cancelled.
         hiddenExecShells.values.toList().forEach { shell ->
             closeHiddenExecShell(shell)
         }
+        hiddenExecScope.cancel()
         activeSessions.keys.toList().forEach { sessionId ->
             closeSession(sessionId)
         }
@@ -462,13 +472,19 @@ class LocalTerminalProvider private constructor(
             .trimEnd('\n', '\r')
     }
 
-    private fun closeHiddenExecShell(shell: HiddenExecShell, rawOutput: String = "", token: String = "") {
+    private suspend fun closeHiddenExecShell(
+        shell: HiddenExecShell,
+        rawOutput: String = "",
+        token: String = ""
+    ) {
         if (!shell.closed.compareAndSet(false, true)) return
         hiddenExecShells.remove(shell.key, shell)
         shell.outputChannel.cancel()
         shell.readJob.cancel()
         shell.exitJob.cancel()
-        hiddenExecScope.launch(NonCancellable) {
+        // Teardown always runs to completion, even when a timeout or disconnect cancelled the
+        // caller: a shell retiring half-way would leave the process and its blocked writer behind.
+        withContext(NonCancellable + Dispatchers.IO) {
             try {
                 cancelHiddenExecCommand(rawOutput, token)
             } finally {
@@ -485,7 +501,8 @@ class LocalTerminalProvider private constructor(
     }
 
     private fun destroyHiddenExecProcess(process: Process) {
-        hiddenExecScope.launch(NonCancellable) {
+        // Creation can finish after the call was cancelled, so this cannot ride the exec scope.
+        hiddenExecCleanupScope.launch {
             runCatching { process.destroyForcibly() }
                 .onFailure { Log.w(TAG, "Failed to destroy unclaimed hidden exec process", it) }
         }
